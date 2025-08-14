@@ -1,0 +1,9 @@
+gspread==6.1.2
+google-auth==2.34.0
+pandas==2.2.2
+python-dateutil==2.9.0.post0
+python-dotenv==1.0.1
+requests>=2.32.0
+deep-translator>=1.11.4
+tabulate
+
