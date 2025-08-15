@@ -4,13 +4,13 @@ from textwrap import shorten
 import os
 import sys
 
-# NEW: pandas 與 rich（已在專案中）
+# pandas 與 rich（已在專案中）
 import pandas as pd
 from rich.console import Console
 from rich.table import Table
 from rich import box
 
-from .enrich import enrich_word
+from .enrich import enrich_word, predict_pos
 from .gsheets import (
     add_word, read_df, due_reviews, schedule_next,
     bulk_import_csv, backup_to_csv, open_ws
@@ -55,7 +55,7 @@ def header(title: str):
     print("=" * 60)
 
 # =========================
-# 共用工具（新增）
+# 共用工具
 # =========================
 def _parse_date_str(s: str | None) -> date:
     """允許空白=今天、today/tomorrow、YYYY-MM-DD / YYYY/MM/DD。"""
@@ -102,7 +102,11 @@ def action_add_word():
     if not word:
         print("⚠ 必填：Word")
         return
-    pos = ask("POS（詞性，如 n. / v. / adj.）", "n.")
+
+    # 自動預測詞性（使用者可覆寫）
+    auto_pos = predict_pos(word) or "n."
+    pos = ask("POS（詞性，如 n. / v. / adj.）", auto_pos)
+
     meaning = ask("Meaning（中文）")
     example = ask("Example（例句）")
     synonyms = ask("Synonyms（用 | 分隔）")
@@ -111,12 +115,16 @@ def action_add_word():
     review_date = ask_date("Review Date（YYYY-MM-DD / today / tomorrow）", date.today().isoformat())
     note = ask("Note（備註）")
 
-    add_word({
+    added = add_word({
         "Word": word, "POS": pos, "Meaning": meaning, "Example": example,
         "Synonyms": synonyms, "Topic": topic, "Source": source,
         "Review Date": review_date, "Note": note
     })
-    print(f"✅ 已新增：{word}")
+    # add_word 在 gsheets.py 內會做 Word+Meaning 去重；回傳 None/False 皆視為已處理
+    if added is False:
+        print(f"⏩ 已跳過重複：{word}")
+    else:
+        print(f"✅ 已新增：{word}")
     pause()
 
 # =========================
@@ -353,8 +361,11 @@ def action_smart_add():
     auto["Review Date"] = ask("Review Date", date.today().isoformat())
     auto["Note"] = ask("Note", auto.get("Note"))
 
-    add_word(auto)
-    print(f"✅ 已新增：{auto['Word']}")
+    added = add_word(auto)
+    if added is False:
+        print(f"⏩ 已跳過重複：{auto['Word']}")
+    else:
+        print(f"✅ 已新增：{auto['Word']}")
     pause()
 
 # =========================

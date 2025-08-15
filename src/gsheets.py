@@ -1,7 +1,9 @@
 from __future__ import annotations
 import os
+import time
+import random
 from datetime import date, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple, Set, List
 from pathlib import Path
 
 import gspread
@@ -26,13 +28,38 @@ EXPECTED_HEADERS = [
     "Topic", "Source", "Review Date", "Note"
 ]
 
+# =========================
+# Google API 重試 / 退避
+# =========================
+def _retry_gsheet(max_tries: int = 5, base: float = 0.6, factor: float = 2.0, jitter: float = 0.2):
+    """
+    對 gspread 呼叫做指數退避重試。
+    針對常見暫時性錯誤（429/5xx/rateLimitExceeded）會重試。
+    """
+    def deco(fn):
+        def wrapper(*a, **kw):
+            delay = base
+            for i in range(1, max_tries + 1):
+                try:
+                    return fn(*a, **kw)
+                except gspread.exceptions.APIError as e:
+                    msg = str(e).lower()
+                    retryable = any(x in msg for x in ("429", "500", "502", "503", "504", "ratelimit", "rate limit"))
+                    if not retryable or i == max_tries:
+                        raise
+                    time.sleep(delay + random.random() * jitter)
+                    delay *= factor
+        return wrapper
+    return deco
 
+# =========================
+# gspread client / worksheet
+# =========================
 def _client() -> gspread.Client:
     if not Path(SERVICE_ACCOUNT_FILE).exists():
         raise FileNotFoundError(f"找不到金鑰檔：{SERVICE_ACCOUNT_FILE}")
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
     return gspread.authorize(creds)
-
 
 def ensure_headers(ws: gspread.Worksheet) -> None:
     """
@@ -60,7 +87,6 @@ def ensure_headers(ws: gspread.Worksheet) -> None:
     if len(first_row) < len(EXPECTED_HEADERS):
         ws.update("A1:I1", [EXPECTED_HEADERS], value_input_option="USER_ENTERED")
 
-
 def open_ws():
     """開啟工作表；若分頁不存在則建立；並保證表頭正確。"""
     if not SHEET_URL:
@@ -75,10 +101,68 @@ def open_ws():
     ensure_headers(ws)
     return ws
 
+# =========================
+# Word+Meaning 去重快取
+# =========================
+_key_cache: Optional[Set[Tuple[str, str]]] = None  # (word_lower, meaning_lower)
+
+def _normalize_key(word: str, meaning: str) -> Tuple[str, str]:
+    return (str(word or "").strip().lower(), str(meaning or "").strip().lower())
+
+def _build_key_cache(df: pd.DataFrame) -> Set[Tuple[str, str]]:
+    keys: Set[Tuple[str, str]] = set()
+    if df is None or df.empty:
+        return keys
+    if not {"Word", "Meaning"} <= set(df.columns):
+        return keys
+    for _, row in df[["Word", "Meaning"]].fillna("").iterrows():
+        keys.add(_normalize_key(row["Word"], row["Meaning"]))
+    return keys
+
+def refresh_key_cache() -> None:
+    """重建去重快取（大量匯入前後可呼叫）。"""
+    global _key_cache
+    df = read_df()
+    _key_cache = _build_key_cache(df)
+
+def exists_word_meaning(word: str, meaning: str) -> bool:
+    """快速判斷 Word+Meaning 是否已存在（大小寫不敏感）。"""
+    global _key_cache
+    if _key_cache is None:
+        refresh_key_cache()
+    return _normalize_key(word, meaning) in (_key_cache or set())
+
+# =========================
+# 基本資料存取
+# =========================
+@_retry_gsheet()
+def _append_row(ws: gspread.Worksheet, row: List[str]) -> None:
+    ws.append_row(row, value_input_option="USER_ENTERED")
+
+@_retry_gsheet()
+def _append_rows(ws: gspread.Worksheet, rows: List[List[str]]) -> None:
+    # 視需要也可改 ws.update(range, rows) 以減少 API 次數
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
+
+@_retry_gsheet()
+def _update_cell(ws: gspread.Worksheet, r: int, c: int, val: Any) -> None:
+    ws.update_cell(r, c, val)
 
 def add_word(row: Dict[str, Any]) -> None:
-    """新增單字一筆（自動填入缺漏欄位）。"""
+    """
+    新增單字一筆（自動填入缺漏欄位）：
+    - 以 Word+Meaning 去重（已存在 → 跳過並提示）
+    - 自動補 Review Date（空值 → 今天）
+    """
     ws = open_ws()
+
+    # 去重：Word + Meaning
+    word = row.get("Word", "")
+    meaning = row.get("Meaning", "")
+    if word and meaning and exists_word_meaning(word, meaning):
+        print(f"⏩ Skip duplicate (Word+Meaning): {word} / {str(meaning)[:30]}…")
+        return
+
     ordered = [
         row.get("Word", ""),
         row.get("POS", ""),
@@ -87,16 +171,20 @@ def add_word(row: Dict[str, Any]) -> None:
         row.get("Synonyms", ""),
         row.get("Topic", ""),
         row.get("Source", ""),
-        row.get("Review Date", date.today().isoformat()),
+        row.get("Review Date", date.today().isoformat()) or date.today().isoformat(),
         row.get("Note", ""),
     ]
-    ws.append_row(ordered, value_input_option="USER_ENTERED")
+    _append_row(ws, ordered)
 
+    # 更新本地快取
+    global _key_cache
+    if _key_cache is None:
+        _key_cache = set()
+    _key_cache.add(_normalize_key(word, meaning))
 
 def read_df() -> pd.DataFrame:
     ws = open_ws()
     return pd.DataFrame(ws.get_all_records())
-
 
 def due_reviews(as_of: Optional[date] = None) -> pd.DataFrame:
     if as_of is None:
@@ -113,7 +201,6 @@ def due_reviews(as_of: Optional[date] = None) -> pd.DataFrame:
 
     return df[df["Review Date"].apply(_due)].copy()
 
-
 def schedule_next(word: str, days: int = 3) -> bool:
     """將第一個符合的單字之 'Review Date' 往後推 days 天。"""
     ws = open_ws()
@@ -122,25 +209,31 @@ def schedule_next(word: str, days: int = 3) -> bool:
         return False
     row_idx = cells[0].row
     next_date = (date.today() + timedelta(days=days)).isoformat()
-    ws.update_cell(row_idx, 8, next_date)  # H 欄 = Review Date
+    _update_cell(ws, row_idx, 8, next_date)  # H 欄 = Review Date
     return True
 
-
 def bulk_import_csv(csv_path: str) -> int:
-    """批量匯入 CSV；做基本清理並以 Word+Meaning 去重。"""
+    """
+    批量匯入 CSV：
+    - 基本清理與欄位正規化
+    - 以 Word+Meaning 去重（含現有表與本批去重）
+    - 失敗行跳過（維持穩定）
+    """
     df = pd.read_csv(csv_path).fillna("")
     required = {"Word", "POS", "Meaning"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"CSV 缺少欄位: {', '.join(sorted(missing))}")
 
+    # 清理與正規化
     df["Word"] = df["Word"].astype(str).str.strip()
     df["POS"] = (
         df["POS"].astype(str).str.strip().str.lower()
         .str.replace("noun", "n.", regex=False)
         .str.replace("verb", "v.", regex=False)
+        .str.replace("adjective", "adj.", regex=False)
+        .str.replace("adverb", "adv.", regex=False)
     )
-
     if "Review Date" in df.columns:
         def _norm_date(x):
             try:
@@ -149,23 +242,53 @@ def bulk_import_csv(csv_path: str) -> int:
                 return ""
         df["Review Date"] = df["Review Date"].apply(_norm_date)
 
+    # 先用本批去重（Word+Meaning）
     if {"Word", "Meaning"} <= set(df.columns):
         df = df.drop_duplicates(subset=["Word", "Meaning"])
 
+    # 讀現有表建立 key cache（僅一次）
+    refresh_key_cache()
+
+    # 過濾：排除（已存在於表）或（本批重複）
+    to_append: List[List[str]] = []
+    seen_batch: Set[Tuple[str, str]] = set()
+
+    for _, r in df.iterrows():
+        w = str(r.get("Word", "")).strip()
+        m = str(r.get("Meaning", "")).strip()
+        if not w or not m:
+            continue  # 必要欄位缺漏，跳過
+
+        key = _normalize_key(w, m)
+        if key in seen_batch:
+            continue
+        if exists_word_meaning(w, m):
+            continue
+
+        seen_batch.add(key)
+        ordered = [
+            w,
+            r.get("POS", ""),
+            m,
+            r.get("Example", ""),
+            r.get("Synonyms", ""),
+            r.get("Topic", ""),
+            r.get("Source", ""),
+            r.get("Review Date", "") or date.today().isoformat(),
+            r.get("Note", ""),
+        ]
+        to_append.append(ordered)
+
+    if not to_append:
+        return 0
+
     ws = open_ws()
-    existing = read_df()
-    if not existing.empty:
-        key = ["Word", "Meaning"]
-        common = [k for k in key if k in existing.columns and k in df.columns]
-        if common:
-            merged = df.merge(existing[common], on=common, how="left", indicator=True)
-            df = merged[merged["_merge"] == "left_only"].drop(columns=["_merge"])
+    _append_rows(ws, to_append)
 
-    rows = df.reindex(columns=EXPECTED_HEADERS, fill_value="").values.tolist()
-    if rows:
-        ws.append_rows(rows, value_input_option="USER_ENTERED")
-    return len(rows)
-
+    # 匯入後更新快取
+    for w, m in seen_batch:
+        (_key_cache or set()).add((w, m))
+    return len(to_append)
 
 def backup_to_csv(output_path: str) -> None:
     df = read_df()
