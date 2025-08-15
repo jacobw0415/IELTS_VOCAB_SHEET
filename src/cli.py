@@ -13,7 +13,7 @@ from rich import box
 from .enrich import enrich_word, predict_pos
 from .gsheets import (
     add_word, read_df, due_reviews, schedule_next,
-    bulk_import_csv, backup_to_csv, open_ws
+    bulk_import_csv, backup_to_csv, open_ws, export_view_dataframe
 )
 
 # =========================
@@ -120,7 +120,6 @@ def action_add_word():
         "Synonyms": synonyms, "Topic": topic, "Source": source,
         "Review Date": review_date, "Note": note
     })
-    # add_word 在 gsheets.py 內會做 Word+Meaning 去重；回傳 None/False 皆視為已處理
     if added is False:
         print(f"⏩ 已跳過重複：{word}")
     else:
@@ -128,26 +127,15 @@ def action_add_word():
     pause()
 
 # =========================
-# 功能：到期複習清單（優化版）
+# 內部：生成到期複習視圖（回傳排序後 DataFrame 與列印）
 # =========================
-def action_due_reviews():
-    header("到期複習清單")
-    # 友善日期輸入：留空=今天，也接受 today/tomorrow
-    raw = ask_date("查詢日期（留空=今天；today / tomorrow 也可）", "")
-    try:
-        as_of = _parse_date_str(raw)
-    except ValueError as e:
-        print(e)
-        pause()
-        return
-
+def _build_and_show_due(as_of: date, sort_mode: str) -> pd.DataFrame:
     df = due_reviews(as_of)
     if df.empty:
         print("🎉 今天沒有到期要複習的單字")
-        pause()
-        return
+        return df
 
-    # 逾期天數（None 視為最後）
+    # 逾期天數
     if "Review Date" in df.columns:
         def _safe(d):
             try:
@@ -157,39 +145,42 @@ def action_due_reviews():
         df["_review_dt"] = df["Review Date"].map(_safe)
     else:
         df["_review_dt"] = None
-
     df["逾期天數"] = df["_review_dt"].map(lambda d: (as_of - d).days if isinstance(d, date) else None)
 
+    # 欄位
     pref_cols = ["Word", "POS", "Meaning", "Example", "Synonyms", "Topic", "Review Date", "逾期天數"]
     cols = [c for c in pref_cols if c in df.columns]
     if "逾期天數" not in cols and "逾期天數" in df.columns:
         cols.append("逾期天數")
 
-    # 依逾期程度大→小、Topic、Word 排序
-    df_sorted = df.sort_values(by=["逾期天數", "Topic", "Word"], ascending=[False, True, True], na_position="last")
+    # 排序
+    if sort_mode == "pos" and "POS" in df.columns:
+        sort_by = ["POS", "逾期天數", "Word"]
+        ascending = [True, False, True]
+        df_sorted = df.sort_values(by=sort_by, ascending=ascending, na_position="last")
+        sort_label = "詞性分組（POS）"
+    else:
+        sort_by = ["逾期天數", "Topic", "Word"]
+        ascending = [False, True, True]
+        df_sorted = df.sort_values(by=sort_by, ascending=ascending, na_position="last")
+        sort_label = "依逾期（Date）"
 
     total = len(df_sorted)
-    print(f"📅 截止：{as_of.isoformat()}　需複習：{total} 筆\n")
+    print(f"📅 截止：{as_of.isoformat()}　需複習：{total} 筆　🔎 排序：{sort_label}\n")
 
-    # 欄寬規劃（可依需要調整）
+    # 漂亮表格
     width_map = {
         "Word": 18, "POS": 6, "Meaning": 36, "Example": 36,
         "Synonyms": 24, "Topic": 12, "Review Date": 12, "逾期天數": 6
     }
-    width_map = {k: v for k, v in width_map.items() if k in cols}
+    cols = [c for c in cols if c in df_sorted.columns]
     rows = df_sorted[cols].fillna("").to_dict("records")
-
-    # 有 rich → 漂亮表格；沒有 → 純文字整齊化
     try:
         console = Console()
         table = Table(box=box.SIMPLE_HEAVY, show_lines=False, expand=False)
         for c in cols:
-            table.add_column(
-                c,
-                max_width=width_map.get(c, 20),
-                overflow="fold",
-                no_wrap=(c in ["Word", "POS", "Review Date", "逾期天數"])
-            )
+            table.add_column(c, max_width=width_map.get(c, 20), overflow="fold",
+                             no_wrap=(c in ["Word", "POS", "Review Date", "逾期天數"]))
         page_size = int(os.getenv("DUE_PAGE_SIZE", "20"))
         shown = 0
         for chunk in _paginate(rows, page_size=page_size):
@@ -198,46 +189,71 @@ def action_due_reviews():
             console.print(table)
             shown += len(chunk)
             if shown < total:
-                # 重新建一張 table，避免前頁重複
                 table = Table(box=box.SIMPLE_HEAVY, show_lines=False, expand=False)
                 for c in cols:
-                    table.add_column(
-                        c,
-                        max_width=width_map.get(c, 20),
-                        overflow="fold",
-                        no_wrap=(c in ["Word", "POS", "Review Date", "逾期天數"])
-                    )
+                    table.add_column(c, max_width=width_map.get(c, 20), overflow="fold",
+                                     no_wrap=(c in ["Word", "POS", "Review Date", "逾期天數"]))
     except Exception:
-        # 純文字整齊化輸出
+        # 純文字
         headers = [c.ljust(width_map[c]) for c in cols]
         sep = "-".join("".ljust(width_map[c], "-") for c in cols)
-        print(" ".join(headers))
-        print(sep)
+        print(" ".join(headers)); print(sep)
         page_size = int(os.getenv("DUE_PAGE_SIZE", "20"))
         for chunk in _paginate(rows, page_size=page_size):
             for row in chunk:
                 line = []
                 for c in cols:
-                    cell = _format_cell(row.get(c, ""), width_map[c])
+                    cell = str(row.get(c, ""))
                     if c in ("逾期天數",):
-                        line.append(str(cell).rjust(width_map[c]))
+                        line.append(cell.rjust(width_map[c]))
                     else:
-                        line.append(str(cell).ljust(width_map[c]))
+                        line.append(cell.ljust(width_map[c]))
                 print(" ".join(line))
             print()
 
-    # 可選：自動匯出 CSV（DUE_EXPORT=1 才會匯出；預設 1）
+    # CSV 匯出（可關閉）
     if os.getenv("DUE_EXPORT", "1") == "1":
-        out_dir = Path("data/backup")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"due_{as_of.strftime('%Y%m%d')}.csv"
+        out_dir = Path("data/backup"); out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"due_{as_of.strftime('%Y%m%d')}_{sort_mode}.csv"
         try:
-            pd.DataFrame(rows).to_csv(out_path, index=False, encoding="utf-8-sig")
+            df_sorted[cols].to_csv(out_path, index=False, encoding="utf-8-sig")
             print(f"💾 已匯出 CSV：{out_path}")
         except Exception as e:
             print(f"⚠ 匯出 CSV 失敗：{e}")
 
-    print(f"\n共 {total} 筆需要複習。")
+    return df_sorted[cols].copy()
+
+# =========================
+# 功能：到期複習清單（依逾期 / 依詞性）
+# =========================
+def action_due_reviews_date():
+    header("到期複習清單（依逾期）")
+    raw = ask_date("查詢日期（留空=今天；today/tomorrow 也可）", "")
+    try:
+        as_of = _parse_date_str(raw)
+    except ValueError as e:
+        print(e); pause(); return
+
+    df_view = _build_and_show_due(as_of, sort_mode="date")
+    if not df_view.empty:
+        title = f"Due_{as_of.isoformat()}_date"
+        export_view_dataframe(df_view, title)
+        print(f"📤 已同步 Google Sheet 分頁：{title}")
+    pause()
+
+def action_due_reviews_pos():
+    header("到期複習清單（依詞性）")
+    raw = ask_date("查詢日期（留空=今天；today/tomorrow 也可）", "")
+    try:
+        as_of = _parse_date_str(raw)
+    except ValueError as e:
+        print(e); pause(); return
+
+    df_view = _build_and_show_due(as_of, sort_mode="pos")
+    if not df_view.empty:
+        title = f"Due_{as_of.isoformat()}_pos"
+        export_view_dataframe(df_view, title)
+        print(f"📤 已同步 Google Sheet 分頁：{title}")
     pause()
 
 # =========================
@@ -247,20 +263,15 @@ def action_schedule_next():
     header("設定下一次複習日")
     word = ask("要排程的 Word（完全一致比對）")
     if not word:
-        print("⚠ 必填：Word")
-        pause()
-        return
+        print("⚠ 必填：Word"); pause(); return
 
     default_days = os.getenv("DEFAULT_REVIEW_DAYS", "3")
-    hint = f"幾天後複習？（常用：1/3/7/14/30；預設 {default_days}）"
-    raw = ask(hint, default_days).strip()
+    raw = ask(f"幾天後複習？（常用：1/3/7/14/30；預設 {default_days}）", default_days).strip()
     try:
-        days = int(raw)
-        if days < 0:
-            raise ValueError
+        days = int(raw); 
+        if days < 0: raise ValueError
     except ValueError:
-        print("⚠ 天數需為非負整數；已改用預設 3 天")
-        days = 3
+        print("⚠ 天數需為非負整數；已改用預設 3 天"); days = 3
 
     ok = schedule_next(word, days)
     if ok:
@@ -271,73 +282,42 @@ def action_schedule_next():
     pause()
 
 # =========================
-# 功能：批量匯入
+# 功能：批量匯入 / 備份 / 檢視
 # =========================
 def action_bulk_import():
     header("批量匯入 CSV")
     path = ask("CSV 路徑（例如 data/import_template.csv）")
     p = Path(path)
     if not p.exists():
-        print("⚠ 找不到檔案")
-        return
+        print("⚠ 找不到檔案"); return
     try:
-        n = bulk_import_csv(str(p))
-        print(f"✅ 已匯入 {n} 筆")
+        n = bulk_import_csv(str(p)); print(f"✅ 已匯入 {n} 筆")
     except Exception as e:
         print(f"❌ 匯入失敗：{e}")
     pause()
 
-# =========================
-# 功能：備份
-# =========================
 def action_backup():
     header("備份整張表為 CSV")
     out = ask("輸出檔名", f"backup_{date.today().isoformat()}.csv")
-    backup_to_csv(out)
-    print(f"💾 已備份 → {Path(out).resolve()}")
-    pause()
+    backup_to_csv(out); print(f"💾 已備份 → {Path(out).resolve()}"); pause()
 
-# =========================
-# 功能：檢視前 20 筆
-# =========================
 def action_peek_top():
     header("檢視前 20 筆資料")
     df = read_df()
     if df.empty:
-        print("（表中尚無資料）")
-        pause()
-        return
+        print("（表中尚無資料）"); pause(); return
 
-    cols = [c for c in [
-        "Word", "POS", "Meaning", "Example", "Synonyms", "Topic", "Source", "Review Date", "Note"
-    ] if c in df.columns]
+    cols = [c for c in ["Word","POS","Meaning","Example","Synonyms","Topic","Source","Review Date","Note"] if c in df.columns]
     sub = df[cols].head(20).fillna("")
 
-    console = Console()
-    table = Table(box=box.SIMPLE_HEAVY, show_lines=False, expand=False)
-
-    # 可依需求調整每欄最大寬度
-    maxw = {
-        "Word": 16, "POS": 6, "Meaning": 20, "Example": 48,
-        "Synonyms": 28, "Topic": 16, "Source": 18, "Review Date": 12, "Note": 20
-    }
-
-    # 建欄：超出寬度自動換行（fold）
+    console = Console(); table = Table(box=box.SIMPLE_HEAVY, show_lines=False, expand=False)
+    maxw = {"Word":16,"POS":6,"Meaning":20,"Example":48,"Synonyms":28,"Topic":16,"Source":18,"Review Date":12,"Note":20}
     for c in cols:
-        table.add_column(
-            c,
-            no_wrap=False,
-            overflow="fold",
-            max_width=maxw.get(c, 20)
-        )
-
-    # 加列：把換行符移除避免意外斷行
+        table.add_column(c, no_wrap=False, overflow="fold", max_width=maxw.get(c,20))
     for _, row in sub.iterrows():
-        cells = [str(row.get(c, "")).replace("\n", " ").strip() for c in cols]
+        cells = [str(row.get(c, "")).replace("\n"," ").strip() for c in cols]
         table.add_row(*cells)
-
-    console.print(table)
-    pause()
+    console.print(table); pause()
 
 # =========================
 # 功能：智慧新增（自動補）
@@ -346,11 +326,9 @@ def action_smart_add():
     header("智慧新增（只輸入單字，其餘自動補）")
     word = ask("Word（英文單字）")
     if not word:
-        print("⚠ 必填：Word")
-        return
+        print("⚠ 必填：Word"); return
 
     auto = enrich_word(word, want_chinese=False)
-
     print("\n系統預填如下（可按 Enter 接受，或輸入覆蓋）：")
     auto["POS"] = ask("POS", auto.get("POS") or "n.")
     auto["Meaning"] = ask("Meaning", auto.get("Meaning"))
@@ -377,11 +355,12 @@ def main_menu():
         header("IELTS Vocabulary Manager - 互動式選單")
         print("1) 智慧新增（只輸入單字，其餘自動補）")
         print("2) 新增單字（互動式輸入）")
-        print("3) 查看今天到期要複習的單字")
-        print("4) 設定某字的下一次複習日")
-        print("5) 批量匯入 CSV（大量導入）")
-        print("6) 備份整張表為 CSV")
-        print("7) 檢視前 20 筆資料")
+        print("3) 查看到期清單（依逾期）→ 並同步到 Google Sheet 分頁")
+        print("4) 查看到期清單（依詞性）→ 並同步到 Google Sheet 分頁")
+        print("5) 設定某字的下一次複習日")
+        print("6) 批量匯入 CSV（大量導入）")
+        print("7) 備份整張表為 CSV")
+        print("8) 檢視前 20 筆資料")
         print("0) 離開")
         choice = ask("請輸入選項編號", "1")
         if choice == "1":
@@ -389,14 +368,16 @@ def main_menu():
         elif choice == "2":
             action_add_word()
         elif choice == "3":
-            action_due_reviews()
+            action_due_reviews_date()
         elif choice == "4":
-            action_schedule_next()
+            action_due_reviews_pos()
         elif choice == "5":
-            action_bulk_import()
+            action_schedule_next()
         elif choice == "6":
-            action_backup()
+            action_bulk_import()
         elif choice == "7":
+            action_backup()
+        elif choice == "8":
             action_peek_top()
         elif choice == "0":
             print("👋 Bye!")

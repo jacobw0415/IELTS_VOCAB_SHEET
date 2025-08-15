@@ -53,13 +53,20 @@ def _retry_gsheet(max_tries: int = 5, base: float = 0.6, factor: float = 2.0, ji
     return deco
 
 # =========================
-# gspread client / worksheet
+# gspread client / spreadsheet / worksheet
 # =========================
 def _client() -> gspread.Client:
     if not Path(SERVICE_ACCOUNT_FILE).exists():
         raise FileNotFoundError(f"找不到金鑰檔：{SERVICE_ACCOUNT_FILE}")
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
     return gspread.authorize(creds)
+
+def open_spreadsheet() -> gspread.Spreadsheet:
+    """開啟整本試算表。"""
+    if not SHEET_URL:
+        raise RuntimeError("SHEET_URL 未設定，請檢查 .env")
+    gc = _client()
+    return gc.open_by_url(SHEET_URL)
 
 def ensure_headers(ws: gspread.Worksheet) -> None:
     """
@@ -88,16 +95,12 @@ def ensure_headers(ws: gspread.Worksheet) -> None:
         ws.update("A1:I1", [EXPECTED_HEADERS], value_input_option="USER_ENTERED")
 
 def open_ws():
-    """開啟工作表；若分頁不存在則建立；並保證表頭正確。"""
-    if not SHEET_URL:
-        raise RuntimeError("SHEET_URL 未設定，請檢查 .env")
-    gc = _client()
-    sh = gc.open_by_url(SHEET_URL)
+    """開啟主工作表；若分頁不存在則建立；並保證表頭正確。"""
+    sh = open_spreadsheet()
     try:
         ws = sh.worksheet(WORKSHEET_NAME)
     except gspread.exceptions.WorksheetNotFound:
         ws = sh.add_worksheet(title=WORKSHEET_NAME, rows=1000, cols=10)
-
     ensure_headers(ws)
     return ws
 
@@ -108,6 +111,10 @@ _key_cache: Optional[Set[Tuple[str, str]]] = None  # (word_lower, meaning_lower)
 
 def _normalize_key(word: str, meaning: str) -> Tuple[str, str]:
     return (str(word or "").strip().lower(), str(meaning or "").strip().lower())
+
+def read_df() -> pd.DataFrame:
+    ws = open_ws()
+    return pd.DataFrame(ws.get_all_records())
 
 def _build_key_cache(df: pd.DataFrame) -> Set[Tuple[str, str]]:
     keys: Set[Tuple[str, str]] = set()
@@ -133,7 +140,7 @@ def exists_word_meaning(word: str, meaning: str) -> bool:
     return _normalize_key(word, meaning) in (_key_cache or set())
 
 # =========================
-# 基本資料存取
+# 基本資料存取（含重試）
 # =========================
 @_retry_gsheet()
 def _append_row(ws: gspread.Worksheet, row: List[str]) -> None:
@@ -141,17 +148,16 @@ def _append_row(ws: gspread.Worksheet, row: List[str]) -> None:
 
 @_retry_gsheet()
 def _append_rows(ws: gspread.Worksheet, rows: List[List[str]]) -> None:
-    # 視需要也可改 ws.update(range, rows) 以減少 API 次數
     ws.append_rows(rows, value_input_option="USER_ENTERED")
 
 @_retry_gsheet()
 def _update_cell(ws: gspread.Worksheet, r: int, c: int, val: Any) -> None:
     ws.update_cell(r, c, val)
 
-def add_word(row: Dict[str, Any]) -> None:
+def add_word(row: Dict[str, Any]) -> Optional[bool]:
     """
     新增單字一筆（自動填入缺漏欄位）：
-    - 以 Word+Meaning 去重（已存在 → 跳過並提示）
+    - 以 Word+Meaning 去重（已存在 → 跳過並提示，回傳 False）
     - 自動補 Review Date（空值 → 今天）
     """
     ws = open_ws()
@@ -161,7 +167,7 @@ def add_word(row: Dict[str, Any]) -> None:
     meaning = row.get("Meaning", "")
     if word and meaning and exists_word_meaning(word, meaning):
         print(f"⏩ Skip duplicate (Word+Meaning): {word} / {str(meaning)[:30]}…")
-        return
+        return False
 
     ordered = [
         row.get("Word", ""),
@@ -181,10 +187,7 @@ def add_word(row: Dict[str, Any]) -> None:
     if _key_cache is None:
         _key_cache = set()
     _key_cache.add(_normalize_key(word, meaning))
-
-def read_df() -> pd.DataFrame:
-    ws = open_ws()
-    return pd.DataFrame(ws.get_all_records())
+    return True
 
 def due_reviews(as_of: Optional[date] = None) -> pd.DataFrame:
     if as_of is None:
@@ -282,7 +285,8 @@ def bulk_import_csv(csv_path: str) -> int:
     if not to_append:
         return 0
 
-    ws = open_ws()
+    sh = open_spreadsheet()
+    ws = sh.worksheet(WORKSHEET_NAME)
     _append_rows(ws, to_append)
 
     # 匯入後更新快取
@@ -294,3 +298,29 @@ def backup_to_csv(output_path: str) -> None:
     df = read_df()
     df.to_csv(output_path, index=False, encoding="utf-8-sig")
     print(f"✅ 已匯出至 {output_path}")
+
+# =========================
+# 視圖輸出到 Google Sheet 新分頁
+# =========================
+@_retry_gsheet()
+def _clear_and_set(ws: gspread.Worksheet, headers: List[str], rows: List[List[str]]) -> None:
+    ws.clear()
+    if headers:
+        ws.update(f"A1:{chr(64+len(headers))}1", [headers], value_input_option="USER_ENTERED")
+    if rows:
+        ws.update(f"A2:{chr(64+len(headers))}{len(rows)+1}", rows, value_input_option="USER_ENTERED")
+
+def export_view_dataframe(df: pd.DataFrame, title: str) -> None:
+    """
+    將任意 DataFrame 以新分頁呈現在同一本試算表中。
+    - 若分頁存在：清空後覆寫
+    - 若不存在：建立後寫入
+    """
+    sh = open_spreadsheet()
+    headers = list(df.columns)
+    rows = df.fillna("").values.tolist()
+    try:
+        ws = sh.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows=max(1000, len(rows)+10), cols=max(10, len(headers)+2))
+    _clear_and_set(ws, headers, rows)
