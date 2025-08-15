@@ -7,6 +7,13 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 import re
 import requests
+from requests.adapters import HTTPAdapter
+try:
+    # urllib3 v2
+    from urllib3.util import Retry  # type: ignore
+except Exception:
+    # 兼容舊環境，不強制使用 urllib3 的 Retry（我們本來就有自製退避）
+    Retry = None  # type: ignore
 
 # =========================
 # 可選中文翻譯
@@ -46,8 +53,37 @@ def _cache_save(word: str, payload: Dict[str, Any]) -> None:
         pass
 
 # =========================
-# 重試與退避（HTTP 專用）
+# HTTP Session + 重試與退避
 # =========================
+_DEFAULT_HEADERS = {
+    "User-Agent": "IELTS-Vocab-Manager/1.0 (+https://example.local)"
+}
+
+def _build_session() -> requests.Session:
+    """
+    建立全域 Session：
+    - 共用連線池（降低握手開銷）
+    - 預設 headers（User-Agent）
+    - 讓 adapter 不做自動 retry（total=0），避免和我們的退避邏輯重疊
+    """
+    s = requests.Session()
+    s.headers.update(_DEFAULT_HEADERS)
+
+    # 連線池大小可依需求調整
+    adapter_kwargs = {"pool_connections": 20, "pool_maxsize": 50}
+    if Retry is not None:
+        # 禁用 urllib3 自動 retry（我們用自製退避）
+        r = Retry(total=0, connect=0, read=0, redirect=0, backoff_factor=0)
+        adapter = HTTPAdapter(max_retries=r, **adapter_kwargs)
+    else:
+        adapter = HTTPAdapter(**adapter_kwargs)
+
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+_SESSION = _build_session()
+
 def _retry_http(
     max_tries: int = 5,
     base: float = 0.6,
@@ -59,6 +95,7 @@ def _retry_http(
     輕量級 HTTP 重試裝飾器：
     - 對 429/5xx、自訂例外情境退避重試
     - 指數退避 + 抖動，避免雪崩
+    - 與 Session 搭配使用（Session 不做自動 retry）
     """
     def deco(fn):
         def wrapper(*a, **kw):
@@ -86,7 +123,6 @@ def _retry_http(
 _DATAMUSE = "https://api.datamuse.com/words"
 _DICTAPI = "https://api.dictionaryapi.dev/api/v2/entries/en/"
 
-# 詞性正規化
 _POS_MAP_CANON = {
     "n": "n.", "v": "v.", "adj": "adj.", "adv": "adv.",
     "noun": "n.", "verb": "v.", "adjective": "adj.", "adverb": "adv.",
@@ -94,15 +130,11 @@ _POS_MAP_CANON = {
 }
 
 # =========================
-# 外部請求（帶重試）
+# 外部請求（透過 Session + 退避）
 # =========================
-_DEFAULT_HEADERS = {
-    "User-Agent": "IELTS-Vocab-Manager/1.0 (+https://example.local)"
-}
-
 @_retry_http()
 def _get(url: str, *, params: dict | None = None, timeout: float = 15.0) -> requests.Response:
-    return requests.get(url, params=params, headers=_DEFAULT_HEADERS, timeout=timeout)
+    return _SESSION.get(url, params=params, timeout=timeout)
 
 def _fetch_dictionaryapi(word: str) -> Dict[str, Any]:
     r = _get(_DICTAPI + word, timeout=15)
@@ -114,13 +146,11 @@ def _fetch_datamuse_synonyms(word: str) -> List[str]:
     if not r.ok:
         return []
     raw = [x.get("word", "") for x in r.json() if "word" in x]
-    # 只保留純字詞，過濾掉奇怪符號/片語
     keep = []
     for w in raw:
         w = w.strip()
         if re.fullmatch(r"[A-Za-z\-]+", w):
             keep.append(w.lower())
-    # 去重保序
     seen = set()
     out = []
     for w in keep:
@@ -128,7 +158,6 @@ def _fetch_datamuse_synonyms(word: str) -> List[str]:
             out.append(w); seen.add(w)
     return out[:8]
 
-# ---- Datamuse: 推斷常見詞性（帶重試）----
 def _datamuse_preferred_pos(word: str) -> Optional[str]:
     """
     回傳 'noun'/'verb'/'adjective'/'adverb' 之一；失敗回 None。
@@ -180,18 +209,15 @@ def _pick_best_sense(meanings: list, preferred_pos: Optional[str] = None) -> Dic
         defs = m.get("definitions") or []
         if not defs:
             return None
-        # 優先帶 example
         for d in defs:
             if d.get("definition"):
                 if d.get("example"):
                     return {"pos": pos, "def": d["definition"], "example": d["example"]}
-        # 否則第一個定義
         d0 = defs[0]
         if d0.get("definition"):
             return {"pos": pos, "def": d0["definition"], "example": d0.get("example", "")}
         return None
 
-    # 1) 先找 preferred_pos
     if preferred_pos:
         for m in meanings:
             pos = (m.get("partOfSpeech") or "").lower()
@@ -200,7 +226,6 @@ def _pick_best_sense(meanings: list, preferred_pos: Optional[str] = None) -> Dic
                 if picked:
                     return picked
 
-    # 2) 回退
     for m in meanings:
         picked = pick_from_meaning(m)
         if picked:
@@ -212,7 +237,6 @@ def _norm_pos(pos: str) -> str:
     canon = _POS_MAP_CANON.get(p)
     if canon:
         return canon
-    # 若已經是短寫（n/v/adj/adv 等），補上句點
     if p in {"n", "v", "adj", "adv", "prep", "pron", "conj", "interj"}:
         return p + "."
     return pos or ""
@@ -248,6 +272,7 @@ def predict_pos(word: str) -> Optional[str]:
 def enrich_word(word: str, want_chinese: bool = True) -> Dict[str, Any]:
     """
     核心補齊：
+    - 使用全域 Session 發送 HTTP（連線共用 + header 保持）
     - 自動詞性分類（Datamuse → dictionaryapi.dev fallback）
     - dictionaryapi.dev 取定義/例句
     - Datamuse 取同義詞
@@ -269,12 +294,10 @@ def enrich_word(word: str, want_chinese: bool = True) -> Dict[str, Any]:
         payload = cached
     else:
         payload = {}
-        # 字典主來源
         try:
             payload["dictionaryapi"] = _fetch_dictionaryapi(word)
         except Exception as e:
             payload["dictionaryapi_error"] = str(e)
-        # 同義詞
         try:
             payload["synonyms"] = _fetch_datamuse_synonyms(word)
         except Exception as e:
@@ -286,8 +309,6 @@ def enrich_word(word: str, want_chinese: bool = True) -> Dict[str, Any]:
         data = payload.get("dictionaryapi", {}).get("data", [])
         if isinstance(data, list) and data and isinstance(data[0], dict):
             entry = data[0]
-
-            # Datamuse 推斷詞性（優先）→ fallback dictionaryapi.dev
             preferred_pos = _datamuse_preferred_pos(word)
             best = _pick_best_sense(entry.get("meanings") or [], preferred_pos=preferred_pos)
             pos = _norm_pos(best.get("pos", ""))
