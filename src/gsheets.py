@@ -12,6 +12,9 @@ from dateutil.parser import parse as parse_dt
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
+# 新增：引用主題分類
+from .enrich import classify_topic
+
 # ---------- 穩定載入 .env 與金鑰（無論在根目錄或 src 執行） ----------
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
@@ -220,6 +223,7 @@ def bulk_import_csv(csv_path: str) -> int:
     批量匯入 CSV：
     - 基本清理與欄位正規化
     - 以 Word+Meaning 去重（含現有表與本批去重）
+    - Topic 欄位若為空 → 依 Topic Rules 自動分類補上（含生物、地理）
     - 失敗行跳過（維持穩定）
     """
     df = pd.read_csv(csv_path).fillna("")
@@ -237,6 +241,22 @@ def bulk_import_csv(csv_path: str) -> int:
         .str.replace("adjective", "adj.", regex=False)
         .str.replace("adverb", "adv.", regex=False)
     )
+
+    # Topic 自動分類：僅當現有 Topic 為空時才補
+    if "Topic" not in df.columns:
+        df["Topic"] = ""
+    def _auto_topic(row) -> str:
+        cur = str(row.get("Topic", "")).strip()
+        if cur:
+            return cur
+        w = str(row.get("Word", "")).strip()
+        m = str(row.get("Meaning", "")).strip()
+        e = str(row.get("Example", "")).strip() if "Example" in row else ""
+        s = str(row.get("Synonyms", "")).strip() if "Synonyms" in row else ""
+        return classify_topic(word=w, meaning=m, example=e, synonyms=s) or ""
+
+    df["Topic"] = df.apply(_auto_topic, axis=1)
+
     if "Review Date" in df.columns:
         def _norm_date(x):
             try:
@@ -275,7 +295,7 @@ def bulk_import_csv(csv_path: str) -> int:
             m,
             r.get("Example", ""),
             r.get("Synonyms", ""),
-            r.get("Topic", ""),
+            r.get("Topic", ""),  # 已自動分類或原值
             r.get("Source", ""),
             r.get("Review Date", "") or date.today().isoformat(),
             r.get("Note", ""),
@@ -300,7 +320,7 @@ def backup_to_csv(output_path: str) -> None:
     print(f"✅ 已匯出至 {output_path}")
 
 # =========================
-# 視圖輸出到 Google Sheet 新分頁
+# 視圖輸出到 Google Sheet 新分頁（供 CLI 用）
 # =========================
 @_retry_gsheet()
 def _clear_and_set(ws: gspread.Worksheet, headers: List[str], rows: List[List[str]]) -> None:

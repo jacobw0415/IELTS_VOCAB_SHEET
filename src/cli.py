@@ -3,6 +3,7 @@ from pathlib import Path
 from textwrap import shorten
 import os
 import sys
+import re
 
 # pandas 與 rich（已在專案中）
 import pandas as pd
@@ -15,6 +16,78 @@ from .gsheets import (
     add_word, read_df, due_reviews, schedule_next,
     bulk_import_csv, backup_to_csv, open_ws, export_view_dataframe
 )
+
+# =========================
+# 拼字檢查（可選：pyspellchecker）
+# =========================
+_SPELL_AVAILABLE = False
+try:
+    from spellchecker import SpellChecker
+    _spell = SpellChecker(language="en")
+    _SPELL_AVAILABLE = True
+except Exception:
+    _spell = None  # 退回到基本檢查（只允許 a-z）
+
+_word_re = re.compile(r"^[A-Za-z][A-Za-z\-]*$")  # 基本過濾：英文字母，允許連字號
+
+def _basic_word_ok(word: str) -> bool:
+    """基本檢查：只允許英文字母與可選連字號"""
+    if not word:
+        return False
+    return bool(_word_re.fullmatch(word.strip()))
+
+def is_valid_word(word: str) -> bool:
+    """
+    驗證單字是否合理：
+    - 若有 pyspellchecker：用 unknown() 驗證是否為已知字
+    - 否則：用基本規則檢查（僅 a-z/-）
+    """
+    w = (word or "").strip()
+    if not _basic_word_ok(w):
+        return False
+    if _SPELL_AVAILABLE:
+        try:
+            # unknown() 回傳集合；若為空集合代表都是已知字
+            return len(_spell.unknown([w.lower()])) == 0
+        except Exception:
+            # 安全退回
+            return True
+    return True  # 無拼字庫時，只做基本字元驗證
+
+def suggest_words(word: str, limit: int = 3) -> list[str]:
+    """
+    提議近似拼法（需要 pyspellchecker）。
+    排序策略：
+      1) 先把 correction()（最佳校正）放第一
+      2) 再依 word_probability 由高到低
+      3) 同分時以長度差距較小者優先
+    無庫或異常時回傳空清單。
+    """
+    if not _SPELL_AVAILABLE:
+        return []
+    try:
+        w = (word or "").strip().lower()
+        if not w:
+            return []
+        cands = list(_spell.candidates(w))
+        if not cands:
+            return []
+        # 過濾一些太怪的項（非純字母/連字號），以及與原字相同者
+        cands = [c for c in cands if _basic_word_ok(c)]
+        cands = [c for c in cands if c != w]
+        # 以詞頻機率排序；同分用長度差替代距離
+        cands_sorted = sorted(
+            cands,
+            key=lambda x: (-_spell.word_probability(x), abs(len(x) - len(w)))
+        )
+        # 把最佳校正放到最前面（若存在於候選）
+        best = _spell.correction(w)
+        if best and best in cands_sorted:
+            cands_sorted.remove(best)
+            cands_sorted.insert(0, best)
+        return cands_sorted[:limit]
+    except Exception:
+        return []
 
 # =========================
 # 小工具
@@ -101,6 +174,18 @@ def action_add_word():
     word = ask("Word（英文單字）")
     if not word:
         print("⚠ 必填：Word")
+        return
+
+    # 先驗證單字（錯誤則拒絕並給建議）
+    if not is_valid_word(word):
+        tips = suggest_words(word, limit=3)
+        if tips:
+            print(f"❌ 單字拼寫錯誤或不存在：{word}\n   你是不是想輸入：{', '.join(tips)}")
+        else:
+            print(f"❌ 單字拼寫錯誤或不存在：{word}")
+            if not _SPELL_AVAILABLE:
+                print("  （建議安裝：pip install pyspellchecker 以獲得更精準的檢測與建議）")
+        pause()
         return
 
     # 自動預測詞性（使用者可覆寫）
@@ -327,6 +412,18 @@ def action_smart_add():
     word = ask("Word（英文單字）")
     if not word:
         print("⚠ 必填：Word"); return
+
+    # 先驗證單字（錯誤則拒絕並給建議）
+    if not is_valid_word(word):
+        tips = suggest_words(word, limit=3)
+        if tips:
+            print(f"❌ 單字拼寫錯誤或不存在：{word}\n   你是不是想輸入：{', '.join(tips)}")
+        else:
+            print(f"❌ 單字拼寫錯誤或不存在：{word}")
+            if not _SPELL_AVAILABLE:
+                print("  （建議安裝：pip install pyspellchecker 以獲得更精準的檢測與建議）")
+        pause()
+        return
 
     auto = enrich_word(word, want_chinese=False)
     print("\n系統預填如下（可按 Enter 接受，或輸入覆蓋）：")

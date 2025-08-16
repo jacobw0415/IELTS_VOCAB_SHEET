@@ -53,6 +53,73 @@ def _cache_save(word: str, payload: Dict[str, Any]) -> None:
         pass
 
 # =========================
+# Topic Rules（可由外部 JSON 覆蓋）
+# =========================
+TOPIC_RULES_PATH = os.getenv("TOPIC_RULES_PATH", "data/topics.json")
+
+# 內建預設規則（可覆蓋）
+TOPIC_RULES: Dict[str, List[str]] = {
+    "Technology": ["tech","technology","software","computer","algorithm","device","data","network","ai","robot","chip","database","program","engineering","innovation","server","cloud","internet"],
+    "Education": ["school","student","teacher","curriculum","exam","university","college","literacy","pedagogy","classroom","campus","assignment","homework","lecture"],
+    "Society": ["society","culture","community","policy","equality","justice","poverty","democracy","immigration","crime","gender","welfare","inequality","population"],
+    "Health": ["health","disease","therapy","hospital","doctor","nurse","vaccine","clinic","symptom","treatment","diagnosis","surgery","medicine","patient","public health"],
+    "Art": ["art","painting","music","sculpture","theatre","theater","film","cinema","aesthetic","poetry","gallery","dance","drama","performance"],
+    "Chemistry": ["chemistry","molecule","atom","compound","reaction","acid","base","polymer","catalyst","solvent","organic","inorganic","periodic table","bond"],
+    "Literature": ["novel","poem","literature","narrative","prose","drama","genre","metaphor","author","plot","character","theme","literary"],
+    "Life": ["daily","household","food","grocery","habit","routine","leisure","travel","home","family","shopping","meal","lifestyle","commute"],
+    "Biology": [
+        "biology","biological","organism","animal","plant","species","ecosystem","biodiversity","genetics",
+        "gene","dna","cell","tissue","organ","enzyme","protein","evolution","natural selection",
+        "photosynthesis","respiration","microbe","bacteria","virus","habitat","predator","prey","reproduction"
+    ],
+    "Geography": [
+        "geography","geographic","climate","weather","continent","ocean","sea","coast","mountain",
+        "river","lake","desert","valley","plateau","island","forest","rainfall","latitude","longitude",
+        "earthquake","volcano","tectonic","urban","rural","migration","map","region","landform","topography"
+    ],
+}
+
+def _load_topic_rules_from_file() -> None:
+    """若存在外部 JSON，讀取後覆蓋 TOPIC_RULES。格式：{ "主題": ["kw1","kw2", ...], ... }"""
+    global TOPIC_RULES
+    p = Path(TOPIC_RULES_PATH)
+    if p.exists():
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(obj, dict):
+                TOPIC_RULES = {str(k): [str(x) for x in v] for k, v in obj.items() if isinstance(v, list)}
+        except Exception:
+            # 若外部檔案格式不正確，忽略並維持內建規則
+            pass
+
+_load_topic_rules_from_file()
+
+def classify_topic(word: str = "", meaning: str = "", example: str = "", synonyms: str = "") -> str:
+    """
+    公開 API：依關鍵詞規則分類主題。
+    - 會把 word/meaning/example/synonyms 合併後以英文小寫做關鍵詞匹配
+    - 命中數最多的主題為結果；無命中則回傳空字串
+    """
+    texts = [word or "", meaning or "", example or "", synonyms or ""]
+    blob = (" " + " ".join(texts) + " ").lower()
+    scores: Dict[str, int] = {}
+    for topic, kws in TOPIC_RULES.items():
+        hit = 0
+        for kw in kws:
+            k = kw.lower().strip()
+            if not k:
+                continue
+            # 關鍵詞匹配（寬鬆 + 邊界）
+            if f" {k} " in blob or k in blob:
+                hit += 1
+        if hit:
+            scores[topic] = hit
+    if not scores:
+        return ""
+    # 命中最多者；同分時保持 dict 插入順序（Python 3.7+）
+    return max(scores.items(), key=lambda kv: kv[1])[0]
+
+# =========================
 # HTTP Session + 重試與退避
 # =========================
 _DEFAULT_HEADERS = {
@@ -276,6 +343,7 @@ def enrich_word(word: str, want_chinese: bool = True) -> Dict[str, Any]:
     - 自動詞性分類（Datamuse → dictionaryapi.dev fallback）
     - dictionaryapi.dev 取定義/例句
     - Datamuse 取同義詞
+    - 主題自動分類（Topic Rules；外部 JSON 可覆蓋）
     - 快取可開關（CACHE_ENABLED）
     - 翻譯失敗回英文，避免 Meaning 空白
     """
@@ -325,13 +393,16 @@ def enrich_word(word: str, want_chinese: bool = True) -> Dict[str, Any]:
     # 中文/英文釋義輸出（翻譯失敗就回英文）
     meaning_out = _translate_or_fallback(meaning_en) if want_chinese else (meaning_en or "")
 
+    # 主題自動分類（用英文釋義/例句/同義詞 + 原字）
+    topic_auto = classify_topic(word=word, meaning=meaning_en, example=example, synonyms=synonyms_pipe)
+
     return {
         "Word": word,
         "POS": pos or (predict_pos(word) or "n."),  # 再以 predict_pos 補一次，保底
         "Meaning": meaning_out,
         "Example": example,
         "Synonyms": synonyms_pipe,
-        "Topic": "",
+        "Topic": topic_auto or "",
         "Source": source,
         "Review Date": "",
         "Note": ""

@@ -26,3 +26,4 @@ service_account.json
 # runtime cache
 data/cache/
 datay/cache/
+data/backup/
